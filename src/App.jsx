@@ -7,9 +7,9 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const API_URL = 'http://localhost:8080/api/items'
-const AUTH_URL = 'http://localhost:8080/api/auth'
-const CLAIMS_URL = 'http://localhost:8080/api/claims'
+const API_URL = 'https://lostlink-backend-j830.onrender.com/api/items'
+const AUTH_URL = 'https://lostlink-backend-j830.onrender.com/api/auth'
+const CLAIMS_URL = 'https://lostlink-backend-j830.onrender.com/api/claims'
 
 const initialItems = []
 
