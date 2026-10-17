@@ -1,5 +1,5 @@
 
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 import {
   Search, PlusCircle, MapPin, CalendarDays, ArrowRight,
   PackageSearch, ShieldCheck, Clock3, Heart, Menu, X,
@@ -9,8 +9,22 @@ import './App.css'
 
 const API_URL = 'http://localhost:8080/api/items'
 const AUTH_URL = 'http://localhost:8080/api/auth'
+const CLAIMS_URL = 'http://localhost:8080/api/claims'
 
 const initialItems = []
+
+function normalizeItem(item) {
+  const record = item ?? {}
+
+  return {
+    ...record,
+    name: record.title ?? '',
+    type: typeof record.status === 'string' ? record.status : '',
+    date: record.dateReported ?? '',
+    color: 'blue',
+    icon: PackageSearch,
+  }
+}
 
 const categories = [
   'All Items',
@@ -30,6 +44,23 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [selectedItem, setSelectedItem] = useState(null)
   const [notice, setNotice] = useState('')
+  const [workspaceView, setWorkspaceView] = useState('browse')
+  const [myReports, setMyReports] = useState([])
+  const [myClaims, setMyClaims] = useState([])
+  const [reportClaims, setReportClaims] = useState([])
+  const [claimTarget, setClaimTarget] = useState(null)
+  const [showClaimForm, setShowClaimForm] = useState(false)
+  const [isSubmittingClaim, setIsSubmittingClaim] = useState(false)
+  const [claimError, setClaimError] = useState('')
+  const claimSubmitLock = useRef(false)
+  const [claimForm, setClaimForm] = useState({
+    foundLocation: '',
+    foundDate: new Date().toISOString().slice(0, 10),
+    circumstances: '',
+    contactName: '',
+    contactEmail: '',
+    contactPhone: '',
+  })
 
   const [showAuth, setShowAuth] = useState(false)
   const [authMode, setAuthMode] = useState('login')
@@ -60,20 +91,7 @@ function App() {
 
       const data = await response.json()
 
-      setItems(
-        data.map(item => {
-          const record = item ?? {}
-
-          return {
-            ...record,
-            name: record.title ?? '',
-            type: typeof record.status === 'string' ? record.status : '',
-            date: record.dateReported ?? '',
-            color: 'blue',
-            icon: PackageSearch,
-          }
-        })
-      )
+      setItems(data.map(normalizeItem))
     } catch (error) {
       console.error('Error loading items:', error)
       setNotice('Could not load items. Check whether the backend is running.')
@@ -95,6 +113,133 @@ function App() {
       })
       .catch(error => console.error('Error restoring session:', error))
   }, [])
+
+  async function openMyReports() {
+    if (!currentUser) {
+      openAuth('login')
+      return
+    }
+
+    try {
+      const [itemsResponse, claimsResponse] = await Promise.all([
+        fetch(`${API_URL}/mine`, { credentials: 'include' }),
+        fetch(`${CLAIMS_URL}/for-reports`, { credentials: 'include' }),
+      ])
+      if (!itemsResponse.ok || !claimsResponse.ok) {
+        throw new Error('Could not load your reports.')
+      }
+      const [itemsData, claimsData] = await Promise.all([
+        itemsResponse.json(),
+        claimsResponse.json(),
+      ])
+      setMyReports(itemsData.map(normalizeItem))
+      setReportClaims(claimsData)
+      setWorkspaceView('reports')
+      setNotice('')
+    } catch (error) {
+      setNotice(error.message || 'Could not load your reports.')
+    }
+  }
+
+  async function openMyClaims() {
+    if (!currentUser) {
+      openAuth('login')
+      return
+    }
+
+    try {
+      const response = await fetch(`${CLAIMS_URL}/mine`, { credentials: 'include' })
+      if (!response.ok) throw new Error('Could not load your claims.')
+      setMyClaims(await response.json())
+      setWorkspaceView('claims')
+      setNotice('')
+    } catch (error) {
+      setNotice(error.message || 'Could not load your claims.')
+    }
+  }
+
+  async function submitClaim(event) {
+    event.preventDefault()
+    if (!claimTarget || claimSubmitLock.current) return
+
+    claimSubmitLock.current = true
+    setIsSubmittingClaim(true)
+    setClaimError('')
+    try {
+      const response = await fetch(`${CLAIMS_URL}/items/${claimTarget.id}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(claimForm),
+      })
+      const responseBody = await response.text()
+      let data = {}
+      if (responseBody) {
+        try {
+          data = JSON.parse(responseBody)
+        } catch {
+          data = { detail: responseBody }
+        }
+      }
+      if (!response.ok) {
+        const error = new Error(
+          response.status === 403
+            ? 'You cannot submit a claim for an item you reported.'
+            : response.status === 401
+              ? 'Your login session has expired. Please log in again.'
+              : data?.detail || data?.message || data?.title || data?.error ||
+                `Claim submission failed (${response.status}).`
+        )
+        error.status = response.status
+        throw error
+      }
+      setShowClaimForm(false)
+      setClaimTarget(null)
+      await openMyClaims()
+      setNotice('Your claim has been submitted.')
+    } catch (error) {
+      setClaimError(error.message || 'Could not submit your claim.')
+    } finally {
+      claimSubmitLock.current = false
+      setIsSubmittingClaim(false)
+    }
+  }
+
+  async function updateClaimDecision(claimId, status) {
+    try {
+      const response = await fetch(`${CLAIMS_URL}/${claimId}/decision`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || 'Could not update this claim.')
+      }
+      await openMyReports()
+    } catch (error) {
+      setNotice(error.message || 'Could not update this claim.')
+    }
+  }
+
+  async function confirmClaimReturn(claimId) {
+    try {
+      const response = await fetch(`${CLAIMS_URL}/${claimId}/confirm-return`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || 'Could not confirm the handover.')
+      }
+      await fetchItems()
+      if (workspaceView === 'reports') await openMyReports()
+      else await openMyClaims()
+    } catch (error) {
+      setNotice(error.message || 'Could not confirm the handover.')
+    }
+  }
 
   async function submitAuth(event) {
     event.preventDefault()
@@ -167,6 +312,7 @@ function App() {
     setForm(current => ({ ...current, type: reportType }))
     setShowForm(true)
     setSelectedItem(null)
+    setWorkspaceView('browse')
     setShowAuth(false)
     setNotice('')
   }
@@ -189,6 +335,10 @@ function App() {
 
       if (!response.ok) throw new Error('Could not log out.')
       setCurrentUser(null)
+      setWorkspaceView('browse')
+      setMyReports([])
+      setMyClaims([])
+      setReportClaims([])
     } catch (error) {
       setNotice(error.message || 'Could not log out.')
     }
@@ -481,17 +631,44 @@ function App() {
           <div className="section-heading">
             <div>
               <span className="section-kicker">THE CAMPUS BOARD</span>
-              <h2>Recently reported items</h2>
+              <h2>
+                {workspaceView === 'browse'
+                  ? 'Recently reported items'
+                  : workspaceView === 'reports'
+                    ? 'My Reports'
+                    : 'My Claims'}
+              </h2>
               <p>
-                Take a look. Your missing item might already be here.
+                {workspaceView === 'browse'
+                  ? 'Take a look. Your missing item might already be here.'
+                  : workspaceView === 'reports'
+                    ? 'Items you reported and the claims submitted for them.'
+                    : 'Claims you have submitted for reported items.'}
               </p>
             </div>
 
-            <button className="text-link" onClick={resetFilters}>
-              View all items <ArrowRight size={17} />
-            </button>
+            <div className="claim-view-actions">
+              {currentUser && workspaceView !== 'browse' && (
+                <button className="text-link" onClick={() => setWorkspaceView('browse')}>
+                  Browse Items
+                </button>
+              )}
+              {currentUser && (
+                <>
+                  <button className="text-link" onClick={openMyReports}>My Reports</button>
+                  <button className="text-link" onClick={openMyClaims}>My Claims</button>
+                </>
+              )}
+              {workspaceView === 'browse' && (
+                <button className="text-link" onClick={resetFilters}>
+                  View all items <ArrowRight size={17} />
+                </button>
+              )}
+            </div>
           </div>
 
+          {workspaceView === 'browse' && (
+            <>
           <div className="search-panel">
             <div className="search-box">
               <Search size={20} />
@@ -539,6 +716,8 @@ function App() {
               </button>
             ))}
           </div>
+            </>
+          )}
 
           {notice && (
             <div className="notice" role="status">
@@ -552,8 +731,9 @@ function App() {
             </div>
           )}
 
+          {workspaceView !== 'claims' ? (
           <div className="item-grid">
-            {filteredItems.map((item, index) => {
+            {(workspaceView === 'reports' ? myReports : filteredItems).map((item, index) => {
               const ItemIcon = item.icon || PackageSearch
               const itemType = typeof item.type === 'string' ? item.type : ''
 
@@ -576,6 +756,9 @@ function App() {
                   <div className="item-card-content">
                     <span className="item-category">{item.category}</span>
                     <h3>{item.name}</h3>
+                    {workspaceView === 'reports' && item.returned && (
+                      <span className="status-pill">Returned</span>
+                    )}
                     <p className="item-description">{item.description}</p>
 
                     <div className="item-meta">
@@ -600,15 +783,78 @@ function App() {
               )
             })}
           </div>
+          ) : (
+            <div className="claim-list">
+              {myClaims.map(claim => (
+                <article className="claim-card" key={claim.id}>
+                  <div className="claim-card-heading">
+                    <h3>{claim.itemTitle}</h3>
+                    <span className={`claim-status ${claim.status.toLowerCase()}`}>
+                      {claim.status}
+                    </span>
+                  </div>
+                  <p><strong>Found:</strong> {claim.foundLocation} on {claim.foundDate}</p>
+                  <p>{claim.circumstances}</p>
+                  <p><strong>Contact:</strong> {claim.contactName} · {claim.contactEmail}{claim.contactPhone ? ` · ${claim.contactPhone}` : ''}</p>
+                  {claim.status === 'ACCEPTED' && !claim.finderConfirmedReturn && (
+                    <button className="text-link" onClick={() => confirmClaimReturn(claim.id)}>
+                      Confirm handover
+                    </button>
+                  )}
+                  {claim.status === 'ACCEPTED' && claim.finderConfirmedReturn && (
+                    <p className="claim-confirmation">You confirmed the handover. Waiting for the reporter.</p>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
 
-          {filteredItems.length === 0 && (
+          {workspaceView === 'reports' && reportClaims.length > 0 && (
+            <div className="claim-list">
+              <h3>Claims on your reports</h3>
+              {reportClaims.map(claim => (
+                <article className="claim-card" key={claim.id}>
+                  <div className="claim-card-heading">
+                    <h3>{claim.itemTitle}</h3>
+                    <span className={`claim-status ${claim.status.toLowerCase()}`}>
+                      {claim.status}
+                    </span>
+                  </div>
+                  <p><strong>Finder:</strong> {claim.finderName}</p>
+                  <p><strong>Found:</strong> {claim.foundLocation} on {claim.foundDate}</p>
+                  <p>{claim.circumstances}</p>
+                  <p><strong>Contact:</strong> {claim.contactName} · {claim.contactEmail}{claim.contactPhone ? ` · ${claim.contactPhone}` : ''}</p>
+                  {claim.status === 'PENDING' && (
+                    <div className="claim-actions">
+                      <button className="btn btn-primary" onClick={() => updateClaimDecision(claim.id, 'ACCEPTED')}>Accept</button>
+                      <button className="btn btn-outline" onClick={() => updateClaimDecision(claim.id, 'REJECTED')}>Reject</button>
+                    </div>
+                  )}
+                  {claim.status === 'ACCEPTED' && !claim.reporterConfirmedReturn && (
+                    <button className="text-link" onClick={() => confirmClaimReturn(claim.id)}>
+                      Confirm handover
+                    </button>
+                  )}
+                  {claim.status === 'ACCEPTED' && claim.reporterConfirmedReturn && (
+                    <p className="claim-confirmation">You confirmed the handover. Waiting for the finder.</p>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
+
+          {((workspaceView === 'browse' && filteredItems.length === 0)
+            || (workspaceView === 'reports' && myReports.length === 0)
+            || (workspaceView === 'claims' && myClaims.length === 0)) && (
             <div className="empty-state">
               <PackageSearch size={36} />
-              <h3>No items found</h3>
-              <p>Try another search or clear your filters.</p>
-              <button className="btn btn-primary" onClick={resetFilters}>
-                Clear filters
-              </button>
+              <h3>{workspaceView === 'claims' ? 'No claims yet' : workspaceView === 'reports' ? 'No reports yet' : 'No items found'}</h3>
+              <p>{workspaceView === 'browse' ? 'Try another search or clear your filters.' : 'Your activity will appear here.'}</p>
+              {workspaceView === 'browse' && (
+                <button className="btn btn-primary" onClick={resetFilters}>
+                  Clear filters
+                </button>
+              )}
             </div>
           )}
         </section>
@@ -872,9 +1118,23 @@ function App() {
             <button
               className="btn btn-primary btn-large form-submit"
               onClick={() => {
+                const item = selectedItem
                 setSelectedItem(null)
-                openAuth('login')
-                setNotice('Log in to continue with an item claim.')
+                if (!currentUser) {
+                  openAuth('login')
+                  setNotice('Log in to continue with an item claim.')
+                } else {
+                  setClaimTarget(item)
+                  setClaimForm({
+                    foundLocation: '',
+                    foundDate: new Date().toISOString().slice(0, 10),
+                    circumstances: '',
+                    contactName: currentUser.fullName || '',
+                    contactEmail: currentUser.email || '',
+                    contactPhone: '',
+                  })
+                  setShowClaimForm(true)
+                }
               }}
             >
               {selectedItem.type === 'Found'
@@ -882,6 +1142,116 @@ function App() {
                 : 'I may have found this'}
               <ArrowRight size={18} />
             </button>
+          </section>
+        </div>
+      )}
+
+      {showClaimForm && claimTarget && (
+        <div
+          className="modal-overlay"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget) {
+              setShowClaimForm(false)
+              setClaimTarget(null)
+            }
+          }}
+        >
+          <section
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="claim-title"
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="section-kicker">ITEM CLAIM</span>
+                <h2 id="claim-title">Report finding this item</h2>
+                <p>{claimTarget.name}</p>
+              </div>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={() => {
+                  setShowClaimForm(false)
+                  setClaimTarget(null)
+                }}
+                aria-label="Close claim form"
+              >
+                <X />
+              </button>
+            </div>
+
+            <form onSubmit={submitClaim} className="report-form claim-form">
+              <label>
+                Where did you find it?
+                <input
+                  required
+                  maxLength={150}
+                  value={claimForm.foundLocation}
+                  onChange={event => setClaimForm({ ...claimForm, foundLocation: event.target.value })}
+                />
+              </label>
+              <label>
+                When did you find it?
+                <input
+                  required
+                  type="date"
+                  max={new Date().toISOString().slice(0, 10)}
+                  value={claimForm.foundDate}
+                  onChange={event => setClaimForm({ ...claimForm, foundDate: event.target.value })}
+                />
+              </label>
+              <label>
+                Circumstances
+                <textarea
+                  required
+                  maxLength={1000}
+                  rows={3}
+                  value={claimForm.circumstances}
+                  onChange={event => setClaimForm({ ...claimForm, circumstances: event.target.value })}
+                  placeholder="Describe how you found the item."
+                />
+              </label>
+              <label>
+                Your name
+                <input
+                  required
+                  maxLength={100}
+                  value={claimForm.contactName}
+                  onChange={event => setClaimForm({ ...claimForm, contactName: event.target.value })}
+                />
+              </label>
+              <label>
+                Contact email
+                <input
+                  required
+                  type="email"
+                  maxLength={150}
+                  value={claimForm.contactEmail}
+                  onChange={event => setClaimForm({ ...claimForm, contactEmail: event.target.value })}
+                />
+              </label>
+              <label>
+                Contact phone (optional)
+                <input
+                  type="tel"
+                  maxLength={30}
+                  value={claimForm.contactPhone}
+                  onChange={event => setClaimForm({ ...claimForm, contactPhone: event.target.value })}
+                />
+              </label>
+              {claimError && (
+                <p className="claim-error" role="alert">{claimError}</p>
+              )}
+              <button
+                type="submit"
+                className="btn btn-primary btn-large form-submit"
+                disabled={isSubmittingClaim}
+                aria-busy={isSubmittingClaim}
+              >
+                {isSubmittingClaim ? 'Submitting...' : 'Submit claim'}
+              </button>
+            </form>
           </section>
         </div>
       )}
